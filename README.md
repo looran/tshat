@@ -142,6 +142,12 @@ cargo install --path .
 
 SSH clients that do not support chacha20-poly1305@openssh.com cipher cannot connect, as it is the only cipher implemented by tshat underlaying ssh library _thrussh_. It is the case of JuiceSSH for example.
 
+# Similar projects
+
+* ssh-chat https://github.com/shazow/ssh-chat
+
+ssh-chat is an ssh server that implements a server-based chat system, like tshat. It has lots of feature that i did not consider as essential (private messages, colors, chat kick, /away, ...), the authentication system seemed too complicated and it does not implement proper history. ssh-chat is written in go.
+
 # External documentation
 
 ## SSH protocol
