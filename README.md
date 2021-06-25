@@ -4,7 +4,7 @@
 
 ![Tshat demo](demo/demo_tshat.gif)
 
-## WARNING: at this point (20210624), *tshat* and the underlaying ssh library *thrussh* did not receive much eye scrutiny
+### WARNING: at this point (20210624), *tshat* and the underlaying ssh library *thrussh* did not receive much eye scrutiny
 
 The design is the opposite of usual chat systems : With tshat everything (like chat history or user settings) is stored on the server. The client does not require a specific application (only ssh client), and the protocol is standard SSH.
 
