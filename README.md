@@ -186,15 +186,12 @@ Sequence Diagram for SSH Password Authentication
 
 ## thrussh library (used in tshat)
 
-* Thrussh in Rust
+Thrussh (https://nest.pijul.com/pijul/thrussh) is a full implementation of the SSH 2 protocol, both server-side and client-side.
+Thrussh is completely asynchronous, and can be combined with other protocols using Tokio. Documentation is at https://docs.rs/thrussh/.
 
-	Thrussh (https://nest.pijul.com/pijul/thrussh) is a full implementation of the SSH 2 protocol, both server-side and client-side.
-Thrussh is completely asynchronous, and can be combined with other protocols using Tokio.
-https://docs.rs/thrussh/0.32.9/thrussh/
-https://nest.pijul.com/pijul/thrussh
-example uses
-	https://www.mknowles.com.au/entry/async_ssh_commands_in_rust_nightly/
-	https://github.com/startere/thrussh-example
+Other example uses
+* https://www.mknowles.com.au/entry/async_ssh_commands_in_rust_nightly/
+* https://github.com/startere/thrussh-example
 
 ## Other SSH libraries
 
