@@ -14,6 +14,7 @@ The design is the opposite of usual chat systems : With tshat everything (like c
 * tshat does not require any privileges, only a TCP port must be reachable
 * user authentication by password (argon2) or ssh key (ed25519/rsa)
 * chat log and user settings can be logged to file and remembered accross server restarts by using _-l <logfile>_
+* option to forget messages as soon as they are received and forwarded to other clients ("no logging", -L)
 
 Example command to run the server with one 'laurent' user using password, and allowing any other user to log-in without password:
 ```
@@ -44,12 +45,13 @@ ARGS:
 FLAGS:
     -d               do not daemonize and log to stdout (twice enables dependencies debugging)
     -h, --help       Prints help information
+    -L               do not remember any history
     -K               generate new server key and do not write key/fingerprint to file
     -V, --version    Prints version information
 
 OPTIONS:
     -k <keyfile>        server key file, defaults to .tshat_key and .tshat_key.fp for fingerprint
-    -l <logfile>        chat log file, default to no logging
+    -l <logfile>        chat log file, default to no file logging
     -p <port>           server port to bind, defaults to 2222
 ```
 
