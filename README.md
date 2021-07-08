@@ -15,16 +15,16 @@ The design is the opposite of usual chat systems : With tshat everything (like c
 * user authentication by password (argon2) or ssh key (ed25519/rsa)
 * chat log and user settings can be logged to file and remembered accross server restarts by using _-l <logfile>_
 
-Example command to run the server with one 'laurent' user using password, and allowing any other user to log-in with whatever password:
+Example command to run the server with one 'laurent' user using password, and allowing any other user to log-in without password:
 ```
-$ tshat laurent:'$argon2id$v=19$m=65536,t=3,p=1$aTNjaXV2SkJyV1haQ0FRYzA5ZDZGTlJ6$xy2aM12e1f8V5iFCJuW/FFHPhEW/DZbWrK+GFsPEnDk' *:*
+$ tshat *:* laurent:'$argon2id$v=19$m=65536,t=3,p=1$aTNjaXV2SkJyV1haQ0FRYzA5ZDZGTlJ6$xy2aM12e1f8V5iFCJuW/FFHPhEW/DZbWrK+GFsPEnDk'
 ```
 
 Users definition can also be passed line by line through stdin by using '-'.
 ```
 $ cat | tshat - <<-_EOF
-laurent:'$argon2id$v=19$m=65536,t=3,p=1$aTNjaXV2SkJyV1haQ0FRYzA5ZDZGTlJ6$xy2aM12e1f8V5iFCJuW/FFHPhEW/DZbWrK+GFsPEnDk'
 *:*
+laurent:'$argon2id$v=19$m=65536,t=3,p=1$aTNjaXV2SkJyV1haQ0FRYzA5ZDZGTlJ6$xy2aM12e1f8V5iFCJuW/FFHPhEW/DZbWrK+GFsPEnDk'
 _EOF
 ```
 
@@ -117,6 +117,24 @@ The definition of a user is as follows:
 
 IP address of the connecting users are logged and printed in the chat.
 
+## Filter access by password only, allowing any username
+
+The special username * can be used in users definition:
+
+``` bash
+$ tshat *:'$argon2id$v=19$m=2097152,t=3,p=1$YmxhYmFsYmxh$XwxqV3larNmnGMjG9rnTo0GcabudWqdjQt9mxszNqfQ'
+```
+
+This will allow any username provided with the correct password.
+
+## Allow any password for a given user
+
+It is possible to use the special password entry * to allow any password for a user:
+
+``` bash
+$ tshat toto:*
+```
+
 # Build and install
 
 The usual rust and cargo way.
@@ -140,7 +158,17 @@ cargo install --path .
 
 *tshat* server has been tested on Linux.
 
-SSH clients that do not support chacha20-poly1305@openssh.com cipher cannot connect, as it is the only cipher implemented by tshat underlaying ssh library _thrussh_. It is the case of JuiceSSH for example.
+SSH clients that do not support chacha20-poly1305@openssh.com cipher cannot connect, as it is the only cipher implemented by tshat underlaying ssh library _thrussh_.
+
+Android clients implementing chacha20-poly1305@openssh.com, as of 20210626:
+* Termius
+* OpenSSH in Termux
+
+Not implenting it:
+* JuiceSSH
+* ConnectBot
+* Mobile SSH
+* Admin Hands
 
 # Similar projects
 

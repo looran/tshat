@@ -14,6 +14,8 @@ extern crate fork;
 extern crate data_encoding;
 extern crate log;
 extern crate env_logger;
+extern crate zeroize;
+extern crate md5;
 use std::sync::{Mutex, Arc};
 use std::str;
 use std::mem;
@@ -28,14 +30,15 @@ use regex::Regex;
 use sodiumoxide::crypto::pwhash::argon2id13;
 use thrussh_keys::PublicKeyBase64;
 use log::{warn, info, debug};
+use zeroize::{Zeroize, Zeroizing};
 
 const HISTORY_MAX: usize = 100;
 
 struct Tshat {
     users: HashMap<String, Arc<User>>,
     usersess_map: HashMap<(usize, thrussh::ChannelId), Arc<Mutex<UserSession>>>,
-    history: History,
-    keyfp: String,
+    history: Option<History>,
+    keyfp: (String, String), // SHA256 and MD5
     config: Arc<thrussh::server::Config>,
 }
 
@@ -125,7 +128,7 @@ $ ssh-keygen -f /tmp/mysshkey -t ed25519")
         .arg(clap::Arg::new("logfile")
                 .short('l')
                 .value_name("logfile")
-                .about("chat log file, default to no logging"))
+                .about("chat log file, default to no file logging"))
         .arg(clap::Arg::new("keyfile")
                 .short('k')
                 .value_name("keyfile")
@@ -133,6 +136,9 @@ $ ssh-keygen -f /tmp/mysshkey -t ed25519")
         .arg(clap::Arg::new("serverkeynofile")
                 .short('K')
                 .about("generate new server key and do not write key/fingerprint to file"))
+        .arg(clap::Arg::new("nohistory")
+                .short('L')
+                .about("do not remember any history"))
         .arg(clap::Arg::new("users")
                 .required(true)
                 .multiple(true)
@@ -189,8 +195,12 @@ $ ssh-keygen -f /tmp/mysshkey -t ed25519")
     info!("listenning on {}", addr);
 
     let logfile = args.value_of("logfile");
+    let nohistory = args.is_present("nohistory");
+    if nohistory && logfile.is_some() {
+        return Err("cannot specify -l and -L at the same time".to_string());
+    }
     
-    let tshat = Tshat::new(keypath, users_map, auth_methods, logfile)?;
+    let tshat = Tshat::new(keypath, users_map, auth_methods, nohistory, logfile)?;
 
     if daemonize {
         match fork::daemon(false, false) {
@@ -228,6 +238,7 @@ fn parse_users(users_list: Vec<&str>) -> Result<(HashMap<String, User>, thrussh:
                                 return Err(format!("user {} cannot have any-password when password was specified before", user));
                             }
                             suser.passwd_any = true;
+                            auth_methods |= thrussh::MethodSet::KEYBOARD_INTERACTIVE;
                         } else if auths.starts_with("$argon2id$") {
                             if suser.passwd_any {
                                 return Err(format!("user {} cannot have password when any-password was specified before", user));
@@ -295,6 +306,22 @@ pub fn hash(passwd: &str) -> (String, argon2id13::HashedPassword) {
     (texthash, hash)
 }
 
+/// XXX patch thrussh-keys
+pub trait MD5Hash {
+    fn fingerprint_md5(&self) -> String;
+}
+impl MD5Hash for thrussh_keys::key::PublicKey {
+    fn fingerprint_md5(&self) -> String {
+        let key = self.public_key_bytes();
+        let mut c = md5::Context::new();
+        c.consume(&key[..]);
+        c.compute().into_iter()
+            .map(|x| format!("{:02x}", x))
+            .collect::<Vec<String>>()
+            .join(":")
+    }
+}
+
 impl User {
     fn new(name: String) -> User {
         User {
@@ -329,7 +356,12 @@ impl User {
         Err("unknown public key".to_string())
     }
     fn auth(&self, password: Option<&str>, pubkey: Option<&thrussh_keys::key::PublicKey>) -> Result<(), String> {
-        if password.is_some() {
+        if password.is_none() && pubkey.is_none() {
+            match self.passwd_any {
+                true => Ok(()),
+                false => Err(format!("Authentication without password not allowed for user {}", self.name)),
+            }
+        } else if password.is_some() {
             self.auth_password(password.unwrap())
         } else if pubkey.is_some() {
             self.auth_pubkey(pubkey.unwrap())
@@ -382,6 +414,13 @@ impl Event {
     }
 }
 
+impl Zeroize for Event {
+    fn zeroize(&mut self) {
+        self.nick.zeroize();
+        self.text.zeroize();
+    }
+}
+
 impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.evt {
@@ -395,7 +434,7 @@ impl fmt::Display for Event {
 }
 
 impl Tshat {
-    fn new(keypath: Option<&str>, users_map: HashMap<String, User>, auth_methods: thrussh::MethodSet, logfile: Option<&str>) -> Result<Tshat, String> {
+    fn new(keypath: Option<&str>, users_map: HashMap<String, User>, auth_methods: thrussh::MethodSet, nohistory: bool, logfile: Option<&str>) -> Result<Tshat, String> {
         /* generate or read server keys */
         let secretkey = match keypath {
             Some(keypath) => {
@@ -428,13 +467,15 @@ impl Tshat {
         let keypair = thrussh_keys::key::KeyPair::Ed25519(secretkey.clone());
 
         /* generate and store server key fingerprint */
-        let keyfp = format!("SHA256:{}", keypair.clone_public_key().fingerprint());
-        info!("ssh server key fingerprint {}", keyfp);
+        let keyfp_sha256 = format!("SHA256:{}", keypair.clone_public_key().fingerprint());
+        let keyfp_md5 = format!("MD5:{}", keypair.clone_public_key().fingerprint_md5());
+        let keyfp_txt = format!("server ED25519 fingerprint {}\nserver ED25519 fingerprint {}", keyfp_sha256, keyfp_md5);
+        info!("{}", keyfp_txt);
         if let Some(keypath) = keypath {
             let fppath = format!("{}.fp", keypath);
             if let Ok(mut fpfile) = OpenOptions::new().mode(0o600).write(true).create(true).open(&fppath) {
-                let keyfpn = format!("{}\n", keyfp);
-                fpfile.write(keyfpn.as_bytes()).expect("could not write to key fingerprint file");
+                let keyfp_txtn = format!("{}\n", keyfp_txt);
+                fpfile.write(keyfp_txtn.as_bytes()).expect("could not write to key fingerprint file");
             } else {
                 return Err(format!("could not open key fingerprint file for writing: {}", fppath));
             }
@@ -448,12 +489,18 @@ impl Tshat {
         debug!("users: {:?}", users.keys());
 
         /* initialize history */
-        let mut history = History::new();
-        if let Some(logfile) = logfile {
-            history.load_log(logfile)?;
-            history.update_userconf(&users);
-        }
-        history.push(Event::new(EventType::Server, None, "".to_string(), "startup"));
+        let history = match nohistory {
+            true => None,
+            false => {
+                let mut history = History::new();
+                if let Some(logfile) = logfile {
+                    history.load_log(logfile)?;
+                    history.update_userconf(&users);
+                }
+                history.push(Event::new(EventType::Server, None, "".to_string(), "startup"));
+                Some(history)
+            },
+        };
 
         /* create ssh server configuration */
         let mut config = thrussh::server::Config::default();
@@ -469,7 +516,7 @@ impl Tshat {
             users: users,
             usersess_map: HashMap::new(),
             history: history,
-            keyfp: keyfp,
+            keyfp: (keyfp_sha256, keyfp_md5),
             config: Arc::new(config),
         })
     }
@@ -599,6 +646,26 @@ impl thrussh::server::Handler for Handler {
         futures::future::ready(Ok((self, s)))
     }
 
+    fn auth_keyboard_interactive(mut self, user: &str, submethods: &str, response: Option<thrussh::server::Response>) -> Self::FutureAuth {
+        debug!("XXX auth_keyboard_interactive user={} submethods={} response={:?}", user, submethods, response);
+        let res = {
+            let tshat = self.tshat.lock().expect("internal error: cannot lock on tshat");
+            tshat.auth(user, None, None)
+        };
+        match res {
+            Ok(suser) => {
+                debug!("auth_keyboard_interactive: authenticated successfully for user '{}'", user);
+                self.user = Some(suser);
+                self.auth_username = Some(user.to_string());
+                self.finished_auth(thrussh::server::Auth::Accept)
+            },
+            Err(e) => {
+                debug!("auth_keyboard_interactive: rejected user '{}' : {}", user, e);
+                self.finished_auth(thrussh::server::Auth::Reject)
+            },
+        }
+    }
+
     fn auth_publickey(mut self, user: &str, pubkey: &thrussh_keys::key::PublicKey) -> Self::FutureAuth {
         let res = {
             let tshat = self.tshat.lock().expect("internal error: cannot lock on tshat");
@@ -655,23 +722,26 @@ impl thrussh::server::Handler for Handler {
                                 us.sendbuf_prompt_restore();
                                 us.sendbuf_send();
                             }
-                            tshat.history.push(event);
+                            if let Some(ref mut history) = tshat.history {
+                                history.push(event);
+                            }
                             usersess.connect();
-                            usersess.sendbuf_push_welcome(&tshat.keyfp, &tshat.users);
+                            usersess.sendbuf_push_welcome(&tshat.users);
                             let lastseen = {
                                 match usersess.user.name.as_str() {
                                     "*" => None,
                                     _ => Some(usersess.user.conf.lock().unwrap().lastseen),
                                 }
                             };
-                            usersess.sendbuf_push_history(&tshat.history, lastseen, true);
+                            if let Some(ref mut history) = tshat.history {
+                                usersess.sendbuf_push_history(&history, lastseen, true);
+                            }
                             usersess.sendbuf_push_prompt();
                             usersess.sendbuf_send();
                             usersess.update_lastseen();
                             let usersess = Arc::new(Mutex::new(usersess));
                             self.usersess = Some(usersess.clone());
                             tshat.usersess_map.insert((self.conn_id, channel), usersess.clone());
-                            //tshat.users_sessions.insert((self.conn_id, channel), usersess);
                         } else {
                             warn!("channel_open_session auth_username not set");
                         }
@@ -705,23 +775,31 @@ impl thrussh::server::Handler for Handler {
                             0x0d => {
                                 /* enter */
                                 if usersess.recv_buf.chars().nth(0) == Some('/') {
+                                    /* command */
                                     let event = Event::new(EventType::Command, None, usersess.nick(), &usersess.recv_buf.clone());
-                                    tshat.history.push(event);
+                                    if let Some(ref mut history) = tshat.history {
+                                        history.push(event);
+                                    }
                                     match usersess.recv_buf.as_str() {
                                         "/help" => {
-                                            usersess.sendbuf.push_str("\r\n/history    print all chat history");
+                                            if tshat.history.is_some() {
+                                                usersess.sendbuf.push_str("\r\n/history    print all chat history");
+                                            }
                                             if usersess.user.name != "*" {
                                                 usersess.sendbuf.push_str("\r\n/bell       enable message bell notification");
                                                 usersess.sendbuf.push_str("\r\n/nobell     disable message bell notification");
+                                                usersess.sendbuf.push_str("\r\n/conf       show user configuration");
                                             }
-                                            usersess.sendbuf.push_str("\r\n/conf       show user configuration");
                                             usersess.sendbuf.push_str("\r\n/users      list allowed users and active connections");
+                                            usersess.sendbuf.push_str("\r\n/fp         show server key fingerprint");
                                             usersess.sendbuf.push_str("\r\n/quit       exit chat (shortcut: ctrl-d)");
                                             usersess.sendbuf.push_str("\r\n");
                                         },
                                         "/history" => {
                                             usersess.sendbuf.push_str("\r\n");
-                                            usersess.sendbuf_push_history(&tshat.history, None, false);
+                                            if let Some(ref mut history) = tshat.history {
+                                                usersess.sendbuf_push_history(&history, None, false);
+                                            }
                                         },
                                         "/bell" => {
                                             usersess.sendbuf.push_str("\r\n");
@@ -740,18 +818,26 @@ impl thrussh::server::Handler for Handler {
                                             }
                                         },
                                         "/conf" => {
-                                            let (bell, lastseen) = {
-                                                let userconf = usersess.user.conf.lock().unwrap();
-                                                (userconf.bell, userconf.lastseen)
-                                            };
-                                            let s = format!(concat!("\r\nuser {} configuration:\r\n",
-                                                        "bell: {}\r\n",
-                                                        "lastseen: {}\r\n"), usersess.user.name, bell, lastseen.format("%Y%m%d_%H%M%S"));
-                                            usersess.sendbuf.push_str(&s);
+                                            usersess.sendbuf.push_str("\r\n");
+                                            if usersess.user.name != "*" {
+                                                let (bell, lastseen) = {
+                                                    let userconf = usersess.user.conf.lock().unwrap();
+                                                    (userconf.bell, userconf.lastseen)
+                                                };
+                                                let s = format!(concat!("user {} configuration:\r\n",
+                                                            "bell: {}\r\n",
+                                                            "lastseen: {}\r\n"), usersess.user.name, bell, lastseen.format("%Y%m%d_%H%M%S"));
+                                                usersess.sendbuf.push_str(&s);
+                                            }
                                         },
                                         "/users" => {
                                             usersess.sendbuf.push_str("\r\n");
                                             usersess.sendbuf_push_users(&tshat.users);
+                                        },
+                                        "/fp" => {
+                                            let s = format!(concat!("\r\nserver ED25519 fingerprint {}\r\n",
+                                                        "server ED25519 fingerprint {}\r\n"), &tshat.keyfp.0, &tshat.keyfp.1);
+                                            usersess.sendbuf.push_str(&s);
                                         },
                                         "/quit" => {
                                             usersess.sendbuf.push_str("\r\ngoodbye\r\n");
@@ -762,6 +848,7 @@ impl thrussh::server::Handler for Handler {
                                         },
                                     }
                                 } else {
+                                    /* normal text */
                                     let event = Event::new(EventType::Text, None, usersess.nick(), &usersess.recv_buf.clone());
                                     /* print text locally */
                                     usersess.sendbuf_prompt_hide();
@@ -779,7 +866,9 @@ impl thrussh::server::Handler for Handler {
                                         }
                                     }
                                     /* store text in history */
-                                    tshat.history.push(event);
+                                    if let Some(ref mut history) = tshat.history {
+                                        history.push(event);
+                                    }
                                     did_broadcast = true;
                                 }
                                 /* new prompt */
@@ -880,7 +969,9 @@ impl thrussh::server::Handler for Handler {
                         us.sendbuf_send();
                     }
                 }
-                tshat.history.push(event);
+                if let Some(ref mut history) = tshat.history {
+                    history.push(event);
+                }
                 tshat.usersess_map.remove(&(self.conn_id, channel));
                 self.usersess = None;
             } else {
@@ -938,18 +1029,14 @@ impl UserSession {
         userconf.lastseen = Local::now().with_nanosecond(0).unwrap();
     }
 
-    fn send(&mut self, bytes: &[u8]) {
-        UserSession::asyncsim_send(&self.handle, self.channel, bytes, self.closing);
-    }
-
     /// XXX very ugly way to send to other clients by getting entering the tokio runtime mannually to send data
     /// see https://nest.pijul.com/pijul/thrussh/discussions/38#69cdeb44-99b5-4b78-8a48-6ea2f9fcce8f
-    fn asyncsim_send(handle: &thrussh::server::Handle, channel: thrussh::ChannelId, bytes: &[u8], mut close_after_send: bool) {
+    //fn asyncsim_send(handle: &thrussh::server::Handle, channel: thrussh::ChannelId, bytes: &[u8], mut close_after_send: bool) {
+    fn asyncsim_send(handle: &thrussh::server::Handle, channel: thrussh::ChannelId, buf: thrussh::CryptoVec, mut close_after_send: bool) {
         let tokiohandle = tokio::runtime::Handle::current();
         let mut sess = handle.clone();
-        let buf = bytes.to_owned();
         tokiohandle.spawn(async move {
-            match sess.data(channel, thrussh::CryptoVec::from_slice(&buf)).await {
+            match sess.data(channel, buf).await {
                 Ok(_) => (),
                 Err(_) => {
                     debug!("detected error while send, closing connection");
@@ -966,12 +1053,8 @@ impl UserSession {
         });
     }
 
-    fn send_text(&mut self, text: &str) {
-        self.send(text.as_bytes());
-    }
-
     fn sendbuf_push_line(&mut self, line: &Event) {
-        self.sendbuf.push_str(&line.to_string());
+        self.sendbuf.push_str(&Zeroizing::new(line.to_string()));
     }
     fn sendbuf_prompt_hide(&mut self) {
         for _ in 0..(self.cursor+2) {
@@ -1017,14 +1100,12 @@ impl UserSession {
         }
         /* show the events */
         for ev in &events[from..] {
-            self.sendbuf.push_str(&ev.to_string());
+            self.sendbuf.push_str(&Zeroizing::new(ev.to_string()));
         }
     }
-    fn sendbuf_push_welcome(&mut self, keyfp: &str, users: &HashMap<String, Arc<User>>) {
+    fn sendbuf_push_welcome(&mut self, users: &HashMap<String, Arc<User>>) {
         self.sendbuf.push_str(">>> welcome ");
         self.sendbuf.push_str(&self.nick());
-        self.sendbuf.push_str("\r\n>>> server key fingerprint: ");
-        self.sendbuf.push_str(keyfp);
         self.sendbuf.push_str("\r\n>>> ");
         self.sendbuf_push_users(users);
         self.sendbuf.push_str(">>> type /help to list available commands\r\n");
@@ -1036,7 +1117,6 @@ impl UserSession {
             let us = format!("{}[{}] ", u.name, u.clone().get_active());
             s.push_str(&us);
         }
-        //let users = users.keys().map(|s| &**s).collect::<Vec<_>>().join(", ");
         self.sendbuf.push_str(&s);
         self.sendbuf.push_str("\r\n");
     }
@@ -1044,14 +1124,15 @@ impl UserSession {
         self.sendbuf.push_str("\x07");
     }
     fn sendbuf_push_prompt(&mut self) {
+        self.recv_buf.zeroize();
         self.recv_buf.clear();
         self.sendbuf.push_str("> ");
         self.cursor = 2;
     }
     fn sendbuf_send(&mut self) {
         if self.sendbuf.len() > 0 {
-            let s = self.sendbuf.clone();
-            self.send_text(&s);
+            UserSession::asyncsim_send(&self.handle, self.channel, thrussh::CryptoVec::from_slice(self.sendbuf.as_bytes()), self.closing);
+            self.sendbuf.zeroize();
             self.sendbuf.clear();
         }
     }
